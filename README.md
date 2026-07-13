@@ -1,5 +1,7 @@
 # vcl-normalizer
 
+[![CI](https://github.com/varnish-rs/vcl-normalizer/actions/workflows/ci.yml/badge.svg)](https://github.com/varnish-rs/vcl-normalizer/actions/workflows/ci.yml)
+
 `vcl-normalizer` compares two VCL 4.1 files for **functional equivalence**: it parses
 both, normalizes each to a canonical form (stable naming, sorted
 declarations, canonicalized literals/vmod arguments, lifted inline probes),
