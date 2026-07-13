@@ -13,6 +13,36 @@ declaration order, and file layout (`include`s) legitimately differ without
 changing behavior. Exact textual diff is too strict for that; `vcl-normalizer`
 answers the more useful question.
 
+## Installation
+
+Requires a Rust toolchain ([rustup.rs](https://rustup.rs)).
+
+From crates.io:
+
+```sh
+cargo install vcl-normalizer     # installs `vcl-normalizer` to ~/.cargo/bin
+```
+
+Or from source:
+
+```sh
+git clone https://github.com/varnish-rs/vcl-normalizer.git
+cd vcl-normalizer
+cargo install --path .          # installs `vcl-normalizer` to ~/.cargo/bin
+```
+
+Or build without installing:
+
+```sh
+cargo build --release           # binary at target/release/vcl-normalizer
+```
+
+Run the test suite (`varnishd`/`python3` are optional — tests that need them skip gracefully if absent):
+
+```sh
+cargo test
+```
+
 ## Usage
 
 ```
