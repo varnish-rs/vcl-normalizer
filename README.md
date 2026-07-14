@@ -69,6 +69,7 @@ into them are then compared structurally, verbatim.
 | Flag | Meaning |
 |---|---|
 | `--rename` | Apply canonical renaming (`backend_1`, `sub_2`, ...) — same as `dump`/`compare` always do. Off by default: original backend/probe/acl/sub names are clearer to read. |
+| `--no-comments` | Omit source comments from the output. By default, `print` re-emits `#`/`//`/`/* */` comments next to the code they were attached to (comments never affect `dump`/`compare`, which stay fully comment-blind). |
 
 ### `compare`-only options
 
