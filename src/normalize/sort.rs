@@ -1,10 +1,10 @@
 //! Normalize pass 5 — top-level declaration sort (`src/normalize/sort.rs`).
 //!
-//! After renaming (pass 4), sort `Program.decls` by `(kind_rank, canonical_json_of_decl)`.
+//! After renaming (pass 4), sort `Program.decls` by `(kind_rank, sub_rank, canonical_json_of_decl)`.
 //! Since names are canonical by that point, this is deterministic and identical
 //! for two structurally-equivalent files regardless of original declaration order.
 
-use crate::ast::{Decl, Program};
+use crate::ast::{Decl, Program, BUILTIN_SUB_ORDER};
 
 fn kind_rank(d: &Decl) -> u8 {
     match d {
@@ -16,14 +16,30 @@ fn kind_rank(d: &Decl) -> u8 {
     }
 }
 
-/// Sorts `p.decls` by `(kind_rank, canonical JSON of the decl)`.
+/// Rank of a `Decl::Sub` within the sub group: its position in
+/// `BUILTIN_SUB_ORDER` (the VCL request-flow order), or `BUILTIN_SUB_ORDER.len()`
+/// for custom/non-classic subs, which then tie-break by name.
+fn sub_rank(d: &Decl) -> usize {
+    match d {
+        Decl::Sub { name, .. } => BUILTIN_SUB_ORDER
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or(BUILTIN_SUB_ORDER.len()),
+        _ => 0,
+    }
+}
+
+/// Sorts `p.decls` by `(kind_rank, sub_rank, canonical JSON of the decl)`.
 pub fn run(p: &mut Program) {
     p.decls.sort_by(|a, b| {
-        kind_rank(a).cmp(&kind_rank(b)).then_with(|| {
-            let sa = serde_json::to_string(a).expect("Decl serialization should never fail");
-            let sb = serde_json::to_string(b).expect("Decl serialization should never fail");
-            sa.cmp(&sb)
-        })
+        kind_rank(a)
+            .cmp(&kind_rank(b))
+            .then_with(|| sub_rank(a).cmp(&sub_rank(b)))
+            .then_with(|| {
+                let sa = serde_json::to_string(a).expect("Decl serialization should never fail");
+                let sb = serde_json::to_string(b).expect("Decl serialization should never fail");
+                sa.cmp(&sb)
+            })
     });
 }
 
