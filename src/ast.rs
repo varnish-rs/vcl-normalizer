@@ -94,6 +94,76 @@ impl VclError {
 
 pub type Result<T> = std::result::Result<T, VclError>;
 
+// ────────────────────── source comments (print-only) ──────────────────────
+//
+// Comments are trivia: never part of the canonical JSON `dump`/`compare`
+// rely on for equivalence (see module doc above), only ever consulted by
+// `printer.rs` for `print`. Attachment is keyed by the `Span` of whichever
+// AST node (Decl/Stmt/Field/AclEntry/Arg) a comment attaches to, rather than
+// living on the node itself -- that keeps every existing struct/enum
+// literal in the crate unchanged and sidesteps `PartialEq`/`Serialize`
+// entirely (a `HashMap` has neither, and doesn't need either here).
+
+/// One verbatim source comment, captured for `print` to re-emit.
+#[derive(Debug, Clone)]
+pub struct LeadingComment {
+    /// Verbatim text including delimiter(s) (`#`, `//`, or `/* ... */`,
+    /// internal newlines intact for block comments).
+    pub text: String,
+    /// True only for a builtin-sub fragment's comment reattached across a
+    /// `normalize::rename::merge_only` merge -- forces column-0 rendering
+    /// regardless of the attached statement's indent level.
+    pub unindented: bool,
+}
+
+/// Comments attached to one AST node.
+#[derive(Debug, Clone, Default)]
+pub struct NodeComments {
+    /// Standalone comment lines immediately preceding the node (no blank
+    /// line or code between them and the node).
+    pub leading: Vec<LeadingComment>,
+    /// A comment sharing the node's own last source line.
+    pub trailing: Option<String>,
+    /// Orphan comments between this node and the next sibling that doesn't
+    /// exist (i.e. this was the last item in its list) -- e.g. right before
+    /// a closing `}`.
+    pub after: Vec<LeadingComment>,
+}
+
+/// Source-comment attachment for a whole `Program`, keyed by a node's
+/// starting position (`Span::file` + `Span::lo` -- two sibling nodes can
+/// never start at the same byte offset, so this is unique; `hi` is
+/// deliberately not part of the key). That's what lets the parser key a
+/// comment to an enclosing node -- e.g. a `backend x { // note` same-line
+/// comment attaching to the `backend` decl itself -- using just the
+/// position it started at, before the decl's closing `}` (and so its full
+/// `Span`) is even known yet.
+#[derive(Debug, Clone, Default)]
+pub struct CommentMap {
+    by_span: std::collections::HashMap<(u32, u32), NodeComments>,
+}
+
+impl CommentMap {
+    fn key(span: Span) -> (u32, u32) {
+        (span.file, span.lo)
+    }
+
+    pub fn get(&self, span: Span) -> Option<&NodeComments> {
+        self.by_span.get(&Self::key(span))
+    }
+
+    pub fn entry(&mut self, span: Span) -> &mut NodeComments {
+        self.by_span.entry(Self::key(span)).or_default()
+    }
+
+    /// Removes and returns a node's comments (used when a `Decl` disappears
+    /// entirely, e.g. a builtin-sub fragment absorbed by
+    /// `normalize::rename::merge_only`).
+    pub fn take(&mut self, span: Span) -> Option<NodeComments> {
+        self.by_span.remove(&Self::key(span))
+    }
+}
+
 // ───────────────────────────── AST ─────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,6 +174,16 @@ pub struct Program {
     #[allow(dead_code)]
     pub vcl_version: Span,
     pub decls: Vec<Decl>,
+    /// Comment attachment for every Decl/Stmt/Field/AclEntry/Arg in the
+    /// tree. Print-only; never serialized.
+    #[serde(skip)]
+    pub comments: CommentMap,
+    /// Orphan comments after the very last top-level decl (end of file).
+    /// Kept separate from a per-decl `.after` because `normalize::sort`
+    /// reorders top-level decls -- end-of-file comments must always print
+    /// at the true end, not wherever the originally-last decl ends up.
+    #[serde(skip)]
+    pub trailing_comments: Vec<LeadingComment>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -313,6 +393,10 @@ pub struct Arg {
     /// Named argument (`resolve=true`); None = positional.
     pub name: Option<String>,
     pub value: Expr,
+    /// Needed only to key `CommentMap` lookups for arg-level comments;
+    /// otherwise unused (not read by any normalize pass).
+    #[serde(skip)]
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -446,6 +530,8 @@ pub mod builder {
         Program {
             vcl_version: sp(),
             decls,
+            comments: CommentMap::default(),
+            trailing_comments: Vec::new(),
         }
     }
 
@@ -617,13 +703,18 @@ pub mod builder {
     }
 
     pub fn arg(value: Expr) -> Arg {
-        Arg { name: None, value }
+        Arg {
+            name: None,
+            value,
+            span: sp(),
+        }
     }
 
     pub fn narg(name: &str, value: Expr) -> Arg {
         Arg {
             name: Some(name.into()),
             value,
+            span: sp(),
         }
     }
 

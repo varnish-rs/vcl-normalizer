@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 /// Parse a root VCL file (splicing includes), returning the AST plus the
 /// `SourceMap` needed to resolve spans for diagnostics/reports.
 pub fn parse_file(path: &Path, include_dirs: &[PathBuf]) -> Result<(Program, ast::SourceMap)> {
-    let (tokens, sm) = lexer::lex(path, include_dirs)?;
-    let mut p = Parser::new(&tokens);
+    let (tokens, comments, sm) = lexer::lex(path, include_dirs)?;
+    let mut p = Parser::new(&tokens, &comments);
     let prog = p.parse_program()?;
     Ok((prog, sm))
 }
@@ -21,8 +21,8 @@ pub fn parse_file(path: &Path, include_dirs: &[PathBuf]) -> Result<(Program, ast
 /// Convenience for tests: parse a string with a dummy path and no includes.
 #[cfg(test)]
 pub fn parse_str(src: &str) -> Result<Program> {
-    let (tokens, _sm) = lexer::lex_str(src)?;
-    let mut p = Parser::new(&tokens);
+    let (tokens, comments, _sm) = lexer::lex_str(src)?;
+    let mut p = Parser::new(&tokens, &comments);
     p.parse_program()
 }
 
@@ -37,8 +37,8 @@ pub fn parse_vcl_show_file(path: &Path) -> Result<(Program, ast::SourceMap)> {
         )
     })?;
     let chunks = crate::vclshow::parse_chunks(&text)?;
-    let (tokens, sm) = crate::lexer::lex_from_vcl_show(&chunks)?;
-    let mut p = Parser::new(&tokens);
+    let (tokens, comments, sm) = crate::lexer::lex_from_vcl_show(&chunks)?;
+    let mut p = Parser::new(&tokens, &comments);
     let prog = p.parse_program()?;
     Ok((prog, sm))
 }
@@ -46,6 +46,19 @@ pub fn parse_vcl_show_file(path: &Path) -> Result<(Program, ast::SourceMap)> {
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
+    /// Comments in source order (see `lexer::RawComment`), consumed
+    /// strictly left-to-right in lockstep with the token stream -- `cidx`
+    /// only ever advances, and every list's `gap` calls (see below) happen
+    /// incrementally, right before parsing each item, rather than
+    /// batched after the fact. That ordering matters: it's what lets an
+    /// enclosing list settle "everything up to my next item" (including a
+    /// same-line trailing comment on itself) *before* control passes down
+    /// into that item's own nested lists -- otherwise a nested list would
+    /// unavoidably race the enclosing one for comments that chronologically
+    /// come first but semantically belong one level up.
+    comments: &'a [lexer::RawComment],
+    cidx: usize,
+    comments_out: ast::CommentMap,
 }
 
 fn span_from(start: Span, end: Span) -> Span {
@@ -57,8 +70,107 @@ fn span_from(start: Span, end: Span) -> Span {
 }
 
 impl<'a> Parser<'a> {
-    fn new(toks: &'a [Token]) -> Self {
-        Parser { toks, pos: 0 }
+    fn new(toks: &'a [Token], comments: &'a [lexer::RawComment]) -> Self {
+        Parser {
+            toks,
+            pos: 0,
+            comments,
+            cidx: 0,
+            comments_out: ast::CommentMap::default(),
+        }
+    }
+
+    /// Drains (and returns) all not-yet-consumed comments strictly before
+    /// byte offset `before`, advancing the shared cursor past them.
+    fn drain_comments_before(&mut self, before: u32) -> &'a [lexer::RawComment] {
+        let comments = self.comments;
+        let start = self.cidx;
+        let mut end = start;
+        while end < comments.len() && comments[end].span.lo < before {
+            end += 1;
+        }
+        self.cidx = end;
+        &comments[start..end]
+    }
+
+    /// Routes one gap's drained comments: an initial same-line-as-`prev`
+    /// run becomes `prev`'s single inline `trailing` comment (only
+    /// meaningful if `prev` exists -- the gap before the very first item
+    /// in a list has no earlier sibling to trail); everything after that
+    /// is a standalone leading-comment block. If `next` exists, that block
+    /// becomes `next`'s `leading`; otherwise it's returned to the caller,
+    /// which decides where trailing/orphan comments at the end of a list
+    /// belong (usually the last item's `after`, but top-level decls route
+    /// to `Program.trailing_comments` instead -- see `parse_program`).
+    fn route_gap(
+        &mut self,
+        drained: &[lexer::RawComment],
+        prev: Option<Span>,
+        next: Option<Span>,
+    ) -> Vec<ast::LeadingComment> {
+        let mut i = 0;
+        if let Some(prev_sp) = prev {
+            if i < drained.len() && !drained[i].standalone {
+                let mut text = drained[i].text.clone();
+                i += 1;
+                while i < drained.len() && !drained[i].standalone {
+                    text.push('\n');
+                    text.push_str(&drained[i].text);
+                    i += 1;
+                }
+                self.comments_out.entry(prev_sp).trailing = Some(text);
+            }
+        }
+        let leading: Vec<ast::LeadingComment> = drained[i..]
+            .iter()
+            .map(|c| ast::LeadingComment {
+                text: c.text.clone(),
+                unindented: false,
+            })
+            .collect();
+        match next {
+            Some(next_sp) => {
+                if !leading.is_empty() {
+                    self.comments_out.entry(next_sp).leading = leading;
+                }
+                Vec::new()
+            }
+            None => leading,
+        }
+    }
+
+    /// Drains and routes exactly one gap. Must be called in true document
+    /// order, immediately before parsing whatever `next` (if `Some`) refers
+    /// to -- one call per gap, working strictly left to right. That's what
+    /// stops a nested list from stealing a comment meant for an enclosing
+    /// one: e.g. for `backend x { // note` + fields, the decl-level caller
+    /// asks about "everything up through `{`" (settling `x`'s own
+    /// `trailing`) *before* the field parser ever starts asking about gaps
+    /// between fields -- so by the time field parsing begins, that
+    /// same-line comment is already spoken for. `next = None` means this is
+    /// a list's final gap (nothing follows) -- the returned overflow is for
+    /// the caller to place (usually the last item's `after`, but top-level
+    /// decls route to `Program.trailing_comments` instead, since
+    /// `normalize::sort` can reorder them -- see `parse_program`).
+    fn gap(
+        &mut self,
+        prev: Option<Span>,
+        before: u32,
+        next: Option<Span>,
+    ) -> Vec<ast::LeadingComment> {
+        let drained = self.drain_comments_before(before).to_vec();
+        self.route_gap(&drained, prev, next)
+    }
+
+    /// Closes out a list: routes the final gap (nothing follows) and
+    /// attaches any overflow as `after` on whichever node is left in
+    /// `prev` -- the last real item if the list wasn't empty, or still the
+    /// list's `enclosing` node (see `gap`'s doc comment) if it was.
+    fn finish_gap(&mut self, prev: Option<Span>, container_hi: u32) {
+        let overflow = self.gap(prev, container_hi, None);
+        if let (Some(target), false) = (prev, overflow.is_empty()) {
+            self.comments_out.entry(target).after = overflow;
+        }
     }
 
     fn cur(&self) -> &Token {
@@ -141,16 +253,35 @@ impl<'a> Parser<'a> {
 
     fn parse_program(&mut self) -> Result<Program> {
         let vcl_version = self.parse_vcl_decl()?;
-        let mut decls = Vec::new();
-        while !matches!(self.peek(), Tok::Eof) {
+        let mut decls: Vec<Decl> = Vec::new();
+        let mut prev: Option<Span> = None;
+        loop {
+            if matches!(self.peek(), Tok::Eof) {
+                break;
+            }
             // Handle secondary vcl declarations (tolerated as no-ops, even on version mismatch)
             if self.is_ident("vcl") {
                 self.parse_secondary_vcl_decl()?;
                 continue;
             }
-            decls.push(self.parse_top_decl()?);
+            let next = self.peek_span();
+            self.gap(prev, next.lo, Some(next));
+            let d = self.parse_top_decl()?;
+            prev = Some(d.span());
+            decls.push(d);
         }
-        Ok(Program { vcl_version, decls })
+        let eof = self.peek_span();
+        // Final-gap overflow goes to `trailing_comments`, not the last
+        // decl's `after` -- `normalize::sort` can reorder top-level decls,
+        // so end-of-file comments must always print at the true end
+        // rather than wherever the originally-last decl ends up.
+        let trailing_comments = self.gap(prev, eof.lo, None);
+        Ok(Program {
+            vcl_version,
+            decls,
+            comments: std::mem::take(&mut self.comments_out),
+            trailing_comments,
+        })
     }
 
     /// Parses version numbers (major.minor) from either a single "X.Y" token or
@@ -257,10 +388,16 @@ impl<'a> Parser<'a> {
         }
         self.expect(Tok::LBrace)?;
         let mut fields = Vec::new();
+        let mut prev = Some(start); // enclosing: same-line comment after '{' trails the decl itself
         while !matches!(self.peek(), Tok::RBrace) {
-            fields.push(self.parse_field()?);
+            let next = self.peek_span();
+            self.gap(prev, next.lo, Some(next));
+            let f = self.parse_field()?;
+            prev = Some(f.span);
+            fields.push(f);
         }
         let rbrace = self.expect(Tok::RBrace)?;
+        self.finish_gap(prev, rbrace.span.lo);
         Ok(Decl::Backend {
             name,
             none: false,
@@ -275,10 +412,16 @@ impl<'a> Parser<'a> {
         let (name, _) = self.expect_any_ident()?;
         self.expect(Tok::LBrace)?;
         let mut fields = Vec::new();
+        let mut prev = Some(start);
         while !matches!(self.peek(), Tok::RBrace) {
-            fields.push(self.parse_field()?);
+            let next = self.peek_span();
+            self.gap(prev, next.lo, Some(next));
+            let f = self.parse_field()?;
+            prev = Some(f.span);
+            fields.push(f);
         }
         let rbrace = self.expect(Tok::RBrace)?;
+        self.finish_gap(prev, rbrace.span.lo);
         Ok(Decl::Probe {
             name,
             body: fields,
@@ -292,10 +435,16 @@ impl<'a> Parser<'a> {
         let (name, _) = self.expect_any_ident()?;
         self.expect(Tok::LBrace)?;
         let mut entries = Vec::new();
+        let mut prev = Some(start);
         while !matches!(self.peek(), Tok::RBrace) {
-            entries.push(self.parse_acl_entry()?);
+            let next = self.peek_span();
+            self.gap(prev, next.lo, Some(next));
+            let e = self.parse_acl_entry()?;
+            prev = Some(e.span);
+            entries.push(e);
         }
         let rbrace = self.expect(Tok::RBrace)?;
+        self.finish_gap(prev, rbrace.span.lo);
         Ok(Decl::Acl {
             name,
             entries,
@@ -337,7 +486,7 @@ impl<'a> Parser<'a> {
         let start = self.peek_span();
         self.advance(); // 'sub'
         let (name, _) = self.expect_any_ident()?;
-        let body = self.parse_block()?;
+        let body = self.parse_block(Some(start))?;
         let end = self.prev_span();
         Ok(Decl::Sub {
             name,
@@ -351,7 +500,7 @@ impl<'a> Parser<'a> {
         self.expect(Tok::Dot)?;
         let (name, _) = self.expect_any_ident()?;
         self.expect(Tok::Eq)?;
-        let value = self.parse_field_value()?;
+        let value = self.parse_field_value(start)?;
         // An inline probe block's closing '}' is the terminator -- real VCC
         // does not allow (and rejects) a trailing ';' after it, unlike every
         // other field-value form. Confirmed against `varnishd -C`.
@@ -367,15 +516,25 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_field_value(&mut self) -> Result<FieldValue> {
+    /// `field_start` is the enclosing `.name = ` field's own start (its
+    /// eventual `Field.span.lo`) -- used only for a same-line comment right
+    /// after an inline probe's opening `{` to trail the field itself,
+    /// rather than being misattached as the first nested field's leading.
+    fn parse_field_value(&mut self, field_start: Span) -> Result<FieldValue> {
         match self.peek().clone() {
             Tok::LBrace => {
-                self.advance();
+                self.expect(Tok::LBrace)?;
                 let mut fields = Vec::new();
+                let mut prev = Some(field_start);
                 while !matches!(self.peek(), Tok::RBrace) {
-                    fields.push(self.parse_field()?);
+                    let next = self.peek_span();
+                    self.gap(prev, next.lo, Some(next));
+                    let f = self.parse_field()?;
+                    prev = Some(f.span);
+                    fields.push(f);
                 }
-                self.advance(); // consume '}'
+                let rbrace = self.expect(Tok::RBrace)?;
+                self.finish_gap(prev, rbrace.span.lo);
                 Ok(FieldValue::Probe(fields))
             }
             // Bare identifier immediately followed by ';' (no dot, no call
@@ -402,17 +561,32 @@ impl<'a> Parser<'a> {
 
     // ───────────────────────── statements ─────────────────────────
 
-    fn parse_block(&mut self) -> Result<Vec<Stmt>> {
+    /// `enclosing`, when given, is the span (well, its `.lo` -- see `gap`'s
+    /// doc comment) a same-line comment right after this block's opening
+    /// `{` should trail -- e.g. the owning `sub name {` line. `None` for
+    /// an if-arm/else body: those share one `Stmt::If` span across
+    /// multiple arms, so there's no single node to trail there; a
+    /// same-line comment right after such an arm's own `{` falls back to
+    /// being the first stmt's leading instead (a narrow, documented gap).
+    fn parse_block(&mut self, enclosing: Option<Span>) -> Result<Vec<Stmt>> {
         self.expect(Tok::LBrace)?;
         let mut stmts = Vec::new();
+        let mut prev = enclosing;
         loop {
             match self.peek() {
                 Tok::RBrace => break,
                 Tok::Eof => return Err(self.error("unterminated block, expected '}'")),
-                _ => stmts.push(self.parse_stmt()?),
+                _ => {
+                    let next = self.peek_span();
+                    self.gap(prev, next.lo, Some(next));
+                    let s = self.parse_stmt()?;
+                    prev = Some(s.span());
+                    stmts.push(s);
+                }
             }
         }
-        self.expect(Tok::RBrace)?;
+        let rbrace = self.expect(Tok::RBrace)?;
+        self.finish_gap(prev, rbrace.span.lo);
         Ok(stmts)
     }
 
@@ -555,7 +729,7 @@ impl<'a> Parser<'a> {
         self.expect(Tok::LParen)?;
         let cond = self.parse_expr()?;
         self.expect(Tok::RParen)?;
-        let body = self.parse_block()?;
+        let body = self.parse_block(None)?;
         let mut arms = vec![(cond, body)];
         let mut else_body = None;
         loop {
@@ -564,7 +738,7 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::LParen)?;
                 let c = self.parse_expr()?;
                 self.expect(Tok::RParen)?;
-                let b = self.parse_block()?;
+                let b = self.parse_block(None)?;
                 arms.push((c, b));
             } else if self.is_ident("else") && matches!(self.peek_at(1), Tok::Ident(s) if s == "if")
             {
@@ -573,11 +747,11 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::LParen)?;
                 let c = self.parse_expr()?;
                 self.expect(Tok::RParen)?;
-                let b = self.parse_block()?;
+                let b = self.parse_block(None)?;
                 arms.push((c, b));
             } else if self.is_ident("else") {
                 self.advance();
-                let b = self.parse_block()?;
+                let b = self.parse_block(None)?;
                 else_body = Some(b);
                 break;
             } else {
@@ -803,12 +977,25 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `container_lo` is the position right after the arg list's opening
+    /// `(`, used to attach any comments preceding the first arg.
     fn parse_arg_list(&mut self) -> Result<Vec<Arg>> {
-        let mut args = vec![self.parse_arg()?];
-        while matches!(self.peek(), Tok::Comma) {
-            self.advance();
-            args.push(self.parse_arg()?);
+        let mut args = Vec::new();
+        let mut prev: Option<Span> = None;
+        loop {
+            let next = self.peek_span();
+            self.gap(prev, next.lo, Some(next));
+            let a = self.parse_arg()?;
+            prev = Some(a.span);
+            args.push(a);
+            if matches!(self.peek(), Tok::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
         }
+        let container_hi = self.peek_span().lo; // ')' not yet consumed
+        self.finish_gap(prev, container_hi);
         Ok(args)
     }
 
@@ -816,19 +1003,27 @@ impl<'a> Parser<'a> {
     /// token after `=` is not itself `=` (so `f(x == 1)` isn't misparsed as
     /// a named argument).
     fn parse_arg(&mut self) -> Result<Arg> {
+        let start = self.peek_span();
         if let Tok::Ident(name) = self.peek().clone() {
             if matches!(self.peek_at(1), Tok::Eq) && !matches!(self.peek_at(2), Tok::EqEq) {
                 self.advance(); // ident
                 self.advance(); // '='
                 let value = self.parse_expr()?;
+                let end = self.prev_span();
                 return Ok(Arg {
                     name: Some(name),
                     value,
+                    span: span_from(start, end),
                 });
             }
         }
         let value = self.parse_expr()?;
-        Ok(Arg { name: None, value })
+        let end = self.prev_span();
+        Ok(Arg {
+            name: None,
+            value,
+            span: span_from(start, end),
+        })
     }
 
     fn parse_expr_list(&mut self) -> Result<Vec<Expr>> {

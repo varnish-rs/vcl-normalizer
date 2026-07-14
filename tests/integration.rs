@@ -987,3 +987,160 @@ fn i13_enum_argument_validated_against_real_vmod_spec() {
         "expected the legal value list in the error:\n{stderr}"
     );
 }
+
+// ─────────────────────────── I14 ───────────────────────────
+
+/// `print` preserves source comments end-to-end (lexer -> parser -> printer,
+/// through the real `--no-vmod` CLI pipeline); `compare`/`dump` stay fully
+/// blind to them, matching `tools/mutate.py`'s `--comments` mutation
+/// invariant (see `i2_corpus_matrix`).
+#[test]
+fn i14_print_preserves_comments_compare_and_dump_stay_blind() {
+    let tmp = unique_tmp_dir("i14-comments");
+    let commented = tmp.join("commented.vcl");
+    fs::write(
+        &commented,
+        r#"vcl 4.1;
+
+// leading comment on a backend
+backend web { // trailing on the opening line
+    .host = "1.2.3.4"; // trailing on a field
+}
+
+sub vcl_recv {
+    // leading comment on a statement
+    set req.http.x = "1";
+
+    // orphan comment right before the closing brace
+}
+"#,
+    )
+    .unwrap();
+
+    let out = run_bin(&["print", "--no-vmod", commented.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr:{}", stderr_of(&out));
+    let printed = stdout_of(&out);
+    assert!(
+        printed.contains("// leading comment on a backend"),
+        "got:\n{printed}"
+    );
+    assert!(
+        printed.contains("backend web {  // trailing on the opening line"),
+        "got:\n{printed}"
+    );
+    assert!(
+        printed.contains(".host = \"1.2.3.4\";  // trailing on a field"),
+        "got:\n{printed}"
+    );
+    assert!(
+        printed.contains("// leading comment on a statement"),
+        "got:\n{printed}"
+    );
+    assert!(
+        printed.contains("// orphan comment right before the closing brace"),
+        "got:\n{printed}"
+    );
+
+    // The commented print output must still be real, re-parseable VCL.
+    let reprinted = tmp.join("commented_printed.vcl");
+    fs::write(&reprinted, &printed).unwrap();
+    let out = run_bin(&["dump", "--no-vmod", reprinted.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "print output should re-parse cleanly\nstderr:{}",
+        stderr_of(&out)
+    );
+
+    // An equivalent file with no comments at all must dump to byte-identical
+    // canonical JSON, and `compare` must report `equivalent` -- comments are
+    // never part of the canonical representation.
+    let uncommented = tmp.join("uncommented.vcl");
+    fs::write(
+        &uncommented,
+        r#"vcl 4.1;
+
+backend web {
+    .host = "1.2.3.4";
+}
+
+sub vcl_recv {
+    set req.http.x = "1";
+}
+"#,
+    )
+    .unwrap();
+
+    let dump_commented = stdout_of(&run_bin(&[
+        "dump",
+        "--no-vmod",
+        commented.to_str().unwrap(),
+    ]));
+    let dump_uncommented = stdout_of(&run_bin(&[
+        "dump",
+        "--no-vmod",
+        uncommented.to_str().unwrap(),
+    ]));
+    assert_eq!(
+        dump_commented, dump_uncommented,
+        "dump output must be identical with or without comments"
+    );
+    assert!(
+        !dump_commented.to_lowercase().contains("comment"),
+        "dump output must never mention comments:\n{dump_commented}"
+    );
+
+    let out = run_bin(&[
+        "compare",
+        "--no-vmod",
+        commented.to_str().unwrap(),
+        uncommented.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr:{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("equivalent"));
+}
+
+// ─────────────────────────── I15 ───────────────────────────
+
+/// `print --no-comments` omits source comments entirely (leading, trailing,
+/// and end-of-file), while a plain `print` still includes them.
+#[test]
+fn i15_print_no_comments_flag_omits_comments() {
+    let tmp = unique_tmp_dir("i15-no-comments");
+    let commented = tmp.join("commented.vcl");
+    fs::write(
+        &commented,
+        r#"vcl 4.1;
+
+// leading comment
+backend web { // trailing comment
+    .host = "1.2.3.4";
+}
+
+# eof comment
+"#,
+    )
+    .unwrap();
+
+    let out = run_bin(&["print", "--no-vmod", commented.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "stderr:{}", stderr_of(&out));
+    let with_comments = stdout_of(&out);
+    assert!(with_comments.contains("// leading comment"));
+    assert!(with_comments.contains("// trailing comment"));
+    assert!(with_comments.contains("# eof comment"));
+
+    let out = run_bin(&[
+        "print",
+        "--no-vmod",
+        "--no-comments",
+        commented.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr:{}", stderr_of(&out));
+    let without_comments = stdout_of(&out);
+    assert!(
+        !without_comments.to_lowercase().contains("comment"),
+        "got:\n{without_comments}"
+    );
+    assert!(without_comments.contains("backend web {"));
+    assert!(without_comments.contains(".host = \"1.2.3.4\";"));
+}

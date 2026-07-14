@@ -245,9 +245,18 @@ fn rewrite_args(args: &mut Vec<ast::Arg>, sig: &Sig, span: ast::Span) -> ast::Re
         result.pop();
     }
 
+    // Rewritten args are brand new positions (reordered/truncated) with no
+    // single original source location, so any arg-level comment attached to
+    // the pre-rewrite args is not carried forward here -- a documented,
+    // narrow gap (only affects calls whose vmod spec is actually loaded;
+    // "Calls to vmods/objects not found in `specs`" above are untouched).
     *args = result
         .into_iter()
-        .map(|value| ast::Arg { name: None, value })
+        .map(|value| ast::Arg {
+            name: None,
+            value,
+            span: ast::Span::dummy(),
+        })
         .collect();
 
     Ok(())

@@ -41,6 +41,14 @@ This tool is deliberately more lenient than real VCC in some places (see README'
 
 If you're unsure whether something is real Varnish behavior, `varnishd` and `varnishd -C -f <file>` are available in dev/CI — use them rather than asserting from memory. Note: this sandbox's `varnishd` build ("The Vinyl Cache Project") accepts ~28 extra internal `vcl_*` hook names beyond real/standard Varnish — don't take everything this specific binary accepts as ground truth for what a real customer's Varnish would accept; cross-check against the Varnish Book / `vcl(7)` when something looks exotic.
 
+## Comments: preserved for `print`, invisible everywhere else
+
+`lexer.rs` captures every `#`/`//`/`/* */` comment as a `RawComment` (verbatim text + span + same-line-as-code flag) instead of discarding it, and `splice_file` keeps that list in the same document order as the token stream across `include` splicing. `parser.rs` correlates each comment to whichever `Decl`/`Stmt`/`Field`/`AclEntry`/`Arg` it attaches to via `ast::CommentMap` (keyed by a node's `(file, lo)` — not the node itself, so no AST struct/enum needed a new field). Attachment happens incrementally, one gap at a time, immediately before parsing whatever comes next (see `Parser::gap`'s doc comment) — batching it after a list is fully parsed lets a nested list's own gap-processing race the enclosing one and steal a same-line comment that belongs one level up (e.g. `backend x { // note` misattaching to the first field instead of `x` itself).
+
+`normalize::rename::merge_only` reattaches a merged-away builtin-sub fragment's own leading/trailing comments onto the first statement it contributes (marked `unindented`, see `ast::LeadingComment`) — a decl-level comment has no home once its decl disappears into an earlier fragment. `normalize::sort` needs no comment-specific handling (comments travel with the `Decl`/`Stmt` struct they're keyed to when it moves) *except* end-of-file orphan comments: those are **not** the last decl's `after`, they live in `Program.trailing_comments`, precisely because `sort` can reorder which decl ends up last.
+
+`printer.rs` is the only consumer (`wrap_comments`/`render_comment_block`). Every field on `CommentMap`/`LeadingComment`/`Program.trailing_comments` is print-only trivia — `canon.rs`/`compare.rs` never see it (no `Serialize`, so it can't leak into `dump`/`canon_eq` even by accident). `dump` and `compare` remain fully comment-blind by design; `tools/mutate.py`'s `--comments` mutation (see `i2_corpus_matrix`) is the regression guard for that invariant.
+
 ## Testing conventions
 
 - **Every bug fix gets both a unit test and a CLI-level integration test** (`tests/integration.rs`, driving the built binary), even when the unit test already covers the logic. Do this proactively, don't wait to be asked.

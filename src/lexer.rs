@@ -55,6 +55,20 @@ pub struct Token {
     pub span: Span,
 }
 
+/// A verbatim comment captured during lexing, for `print` to re-emit later.
+/// Never becomes a `Tok` -- the parser grammar never sees these directly,
+/// they're correlated to nearby AST nodes by `parser.rs` via `span`.
+#[derive(Debug, Clone)]
+pub struct RawComment {
+    pub span: Span,
+    /// Verbatim text including delimiter(s), internal newlines intact for
+    /// `/* ... */` blocks.
+    pub text: String,
+    /// True if no non-whitespace byte precedes it on its own source line
+    /// (i.e. it's not sharing a line with code).
+    pub standalone: bool,
+}
+
 fn mk(tok: Tok, file: u32, lo: usize, hi: usize) -> Token {
     Token {
         tok,
@@ -103,11 +117,21 @@ fn try_match_unit(bytes: &[u8], pos: usize, len: usize) -> Option<(String, usize
 /// Lex a single file's contents (no include handling) into a flat token
 /// stream. Does NOT append an `Eof` token — callers (splicing / top level)
 /// decide where the final `Eof` goes.
-fn lex_single_file(content: &str, file_id: u32) -> Result<Vec<Token>> {
+fn lex_single_file(content: &str, file_id: u32) -> Result<(Vec<Token>, Vec<RawComment>)> {
     let bytes = content.as_bytes();
     let len = bytes.len();
     let mut pos = 0usize;
     let mut toks = Vec::new();
+    let mut comments = Vec::new();
+
+    // True if only whitespace (not counting newlines) precedes `at` on its
+    // own source line -- i.e. this comment doesn't share a line with code.
+    let is_standalone = |at: usize| -> bool {
+        let line_start = content[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        content[line_start..at]
+            .bytes()
+            .all(|b| b == b' ' || b == b'\t' || b == b'\r')
+    };
 
     loop {
         // Skip whitespace + comments.
@@ -121,20 +145,43 @@ fn lex_single_file(content: &str, file_id: u32) -> Result<Vec<Token>> {
                 continue;
             }
             if c == b'#' {
+                let start = pos;
+                let standalone = is_standalone(start);
                 while pos < len && bytes[pos] != b'\n' {
                     pos += 1;
                 }
+                comments.push(RawComment {
+                    span: Span {
+                        file: file_id,
+                        lo: start as u32,
+                        hi: pos as u32,
+                    },
+                    text: content[start..pos].to_string(),
+                    standalone,
+                });
                 continue;
             }
             if c == b'/' && pos + 1 < len && bytes[pos + 1] == b'/' {
+                let start = pos;
+                let standalone = is_standalone(start);
                 pos += 2;
                 while pos < len && bytes[pos] != b'\n' {
                     pos += 1;
                 }
+                comments.push(RawComment {
+                    span: Span {
+                        file: file_id,
+                        lo: start as u32,
+                        hi: pos as u32,
+                    },
+                    text: content[start..pos].to_string(),
+                    standalone,
+                });
                 continue;
             }
             if c == b'/' && pos + 1 < len && bytes[pos + 1] == b'*' {
                 let start = pos;
+                let standalone = is_standalone(start);
                 pos += 2;
                 let mut closed = false;
                 while pos + 1 < len {
@@ -155,6 +202,15 @@ fn lex_single_file(content: &str, file_id: u32) -> Result<Vec<Token>> {
                         "unterminated block comment",
                     ));
                 }
+                comments.push(RawComment {
+                    span: Span {
+                        file: file_id,
+                        lo: start as u32,
+                        hi: pos as u32,
+                    },
+                    text: content[start..pos].to_string(),
+                    standalone,
+                });
                 continue;
             }
             break;
@@ -456,7 +512,7 @@ fn lex_single_file(content: &str, file_id: u32) -> Result<Vec<Token>> {
         toks.push(tok);
     }
 
-    Ok(toks)
+    Ok((toks, comments))
 }
 
 fn resolve_include(raw: &str, including_file: &Path, include_dirs: &[PathBuf]) -> Option<PathBuf> {
@@ -488,7 +544,7 @@ fn splice_file(
     sm: &mut SourceMap,
     stack: &mut Vec<PathBuf>,
     include_span: Option<Span>,
-) -> Result<(Vec<Token>, u32)> {
+) -> Result<(Vec<Token>, Vec<RawComment>, u32)> {
     if stack.len() >= MAX_INCLUDE_DEPTH {
         let span = include_span.unwrap_or(Span::dummy());
         return Err(VclError::new(
@@ -524,13 +580,25 @@ fn splice_file(
     })?;
 
     let file_id = sm.add(path.to_path_buf(), content.clone());
-    let raw = lex_single_file(&content, file_id)?;
+    let (raw, raw_comments) = lex_single_file(&content, file_id)?;
 
     stack.push(canon);
 
     let mut out = Vec::with_capacity(raw.len());
+    let mut out_comments = Vec::new();
+    let mut ci = 0usize; // cursor into raw_comments, not yet flushed
     let mut i = 0;
     while i < raw.len() {
+        // Flush any of this file's own comments that precede the token
+        // we're about to handle, keeping `out_comments` in the same
+        // relative order as `out` (mirrors how `out.extend(spliced)`
+        // below keeps tokens in order across an include splice).
+        let before = raw[i].span.lo;
+        while ci < raw_comments.len() && raw_comments[ci].span.lo < before {
+            out_comments.push(raw_comments[ci].clone());
+            ci += 1;
+        }
+
         let is_include = matches!(&raw[i].tok, Tok::Ident(s) if s == "include")
             && i + 2 < raw.len()
             && matches!(&raw[i + 1].tok, Tok::Str(_))
@@ -545,26 +613,36 @@ fn splice_file(
             let resolved = resolve_include(&inc_path_str, path, include_dirs).ok_or_else(|| {
                 VclError::new(inc_span, format!("include file not found: {inc_path_str}"))
             })?;
-            let (spliced, _child_id) =
+            let (spliced, spliced_comments, _child_id) =
                 splice_file(&resolved, include_dirs, sm, stack, Some(inc_span))?;
             out.extend(spliced);
+            out_comments.extend(spliced_comments);
             i += 3;
         } else {
             out.push(raw[i].clone());
             i += 1;
         }
     }
+    // Flush whatever's left (comments after this file's last token).
+    while ci < raw_comments.len() {
+        out_comments.push(raw_comments[ci].clone());
+        ci += 1;
+    }
 
     stack.pop();
-    Ok((out, file_id))
+    Ok((out, out_comments, file_id))
 }
 
 /// Lex `path` (and splice in all its includes), returning the full token
 /// stream (terminated by `Eof`) plus the populated `SourceMap`.
-pub fn lex(path: &Path, include_dirs: &[PathBuf]) -> Result<(Vec<Token>, SourceMap)> {
+pub fn lex(
+    path: &Path,
+    include_dirs: &[PathBuf],
+) -> Result<(Vec<Token>, Vec<RawComment>, SourceMap)> {
     let mut sm = SourceMap::default();
     let mut stack = Vec::new();
-    let (mut tokens, root_id) = splice_file(path, include_dirs, &mut sm, &mut stack, None)?;
+    let (mut tokens, comments, root_id) =
+        splice_file(path, include_dirs, &mut sm, &mut stack, None)?;
     let end = sm.files[root_id as usize].1.len() as u32;
     tokens.push(Token {
         tok: Tok::Eof,
@@ -574,7 +652,7 @@ pub fn lex(path: &Path, include_dirs: &[PathBuf]) -> Result<(Vec<Token>, SourceM
             hi: end,
         },
     });
-    Ok((tokens, sm))
+    Ok((tokens, comments, sm))
 }
 
 // ─────────────────────────── VCL.SHOW integration ───────────────────────────
@@ -595,14 +673,22 @@ fn splice_chunk(
     state: &mut VclShowState,
     sm: &mut SourceMap,
     _include_span: Option<Span>,
-) -> Result<(Vec<Token>, u32)> {
+) -> Result<(Vec<Token>, Vec<RawComment>, u32)> {
     let chunk = &state.chunks[chunk_idx];
     let file_id = sm.add(PathBuf::from(&chunk.filename), chunk.content.clone());
-    let raw = lex_single_file(&chunk.content, file_id)?;
+    let (raw, raw_comments) = lex_single_file(&chunk.content, file_id)?;
 
     let mut out = Vec::with_capacity(raw.len());
+    let mut out_comments = Vec::new();
+    let mut ci = 0usize;
     let mut i = 0;
     while i < raw.len() {
+        let before = raw[i].span.lo;
+        while ci < raw_comments.len() && raw_comments[ci].span.lo < before {
+            out_comments.push(raw_comments[ci].clone());
+            ci += 1;
+        }
+
         let is_include = matches!(&raw[i].tok, Tok::Ident(s) if s == "include")
             && i + 2 < raw.len()
             && matches!(&raw[i + 1].tok, Tok::Str(_))
@@ -617,16 +703,22 @@ fn splice_chunk(
             }
             let idx = state.next;
             state.next += 1;
-            let (spliced, _child_id) = splice_chunk(idx, state, sm, Some(inc_span))?;
+            let (spliced, spliced_comments, _child_id) =
+                splice_chunk(idx, state, sm, Some(inc_span))?;
             out.extend(spliced);
+            out_comments.extend(spliced_comments);
             i += 3;
         } else {
             out.push(raw[i].clone());
             i += 1;
         }
     }
+    while ci < raw_comments.len() {
+        out_comments.push(raw_comments[ci].clone());
+        ci += 1;
+    }
 
-    Ok((out, file_id))
+    Ok((out, out_comments, file_id))
 }
 
 /// Entry point for lexing a VCL.SHOW dump: parses the chunks and splices
@@ -635,7 +727,7 @@ fn splice_chunk(
 /// populated `SourceMap`.
 pub fn lex_from_vcl_show(
     chunks: &[crate::vclshow::VclShowChunk],
-) -> Result<(Vec<Token>, SourceMap)> {
+) -> Result<(Vec<Token>, Vec<RawComment>, SourceMap)> {
     if chunks.is_empty() {
         return Err(VclError::new(
             Span::dummy(),
@@ -644,7 +736,7 @@ pub fn lex_from_vcl_show(
     }
     let mut sm = SourceMap::default();
     let mut state = VclShowState { chunks, next: 1 }; // chunk 0 is the root; the next chunk any include consumes is chunk 1
-    let (mut tokens, root_id) = splice_chunk(0, &mut state, &mut sm, None)?;
+    let (mut tokens, comments, root_id) = splice_chunk(0, &mut state, &mut sm, None)?;
 
     let leftover = &chunks[state.next..];
     match leftover {
@@ -671,16 +763,16 @@ pub fn lex_from_vcl_show(
             hi: end,
         },
     });
-    Ok((tokens, sm))
+    Ok((tokens, comments, sm))
 }
 
 /// Convenience for tests: lex a string as a standalone virtual file (no
 /// includes unless `include_dirs`-relative paths happen to resolve).
 #[cfg(test)]
-pub fn lex_str(src: &str) -> Result<(Vec<Token>, SourceMap)> {
+pub fn lex_str(src: &str) -> Result<(Vec<Token>, Vec<RawComment>, SourceMap)> {
     let mut sm = SourceMap::default();
     let file_id = sm.add(PathBuf::from("<test>"), src.to_string());
-    let mut tokens = lex_single_file(src, file_id)?;
+    let (mut tokens, comments) = lex_single_file(src, file_id)?;
     let end = src.len() as u32;
     tokens.push(Token {
         tok: Tok::Eof,
@@ -690,7 +782,7 @@ pub fn lex_str(src: &str) -> Result<(Vec<Token>, SourceMap)> {
             hi: end,
         },
     });
-    Ok((tokens, sm))
+    Ok((tokens, comments, sm))
 }
 
 #[cfg(test)]
@@ -865,7 +957,8 @@ mod tests {
         )
         .unwrap();
 
-        let (tokens, sm) = lex(&main_path, std::slice::from_ref(&incdir)).expect("lex ok");
+        let (tokens, _comments, sm) =
+            lex(&main_path, std::slice::from_ref(&incdir)).expect("lex ok");
         let kinds: Vec<Tok> = tokens.iter().map(|t| t.tok.clone()).collect();
         assert_eq!(
             kinds,
@@ -925,7 +1018,7 @@ mod tests {
     #[test]
     fn l9_span_offsets_and_line_col() {
         let src = "ab cd\nef";
-        let (tokens, sm) = lex_str(src).expect("lex ok");
+        let (tokens, _comments, sm) = lex_str(src).expect("lex ok");
         // "ab" at 0..2, "cd" at 3..5, "ef" at 6..8
         assert_eq!(tokens[0].span.lo, 0);
         assert_eq!(tokens[0].span.hi, 2);
@@ -952,14 +1045,14 @@ mod tests {
             content: content.to_string(),
         }];
 
-        let (tokens, sm) = lex_from_vcl_show(&chunks).expect("lex ok");
+        let (tokens, _comments, sm) = lex_from_vcl_show(&chunks).expect("lex ok");
         // Remove the Eof token to compare with plain lex_single_file
         let tokens_without_eof: Vec<Tok> = tokens[..tokens.len() - 1]
             .iter()
             .map(|t| t.tok.clone())
             .collect();
 
-        let (plain_tokens, _) = lex_str(content).expect("plain lex ok");
+        let (plain_tokens, _, _) = lex_str(content).expect("plain lex ok");
         let plain_without_eof: Vec<Tok> = plain_tokens[..plain_tokens.len() - 1]
             .iter()
             .map(|t| t.tok.clone())
@@ -991,7 +1084,7 @@ mod tests {
             },
         ];
 
-        let (tokens, sm) = lex_from_vcl_show(&chunks).expect("lex ok");
+        let (tokens, _comments, sm) = lex_from_vcl_show(&chunks).expect("lex ok");
         let toks: Vec<Tok> = tokens.iter().map(|t| t.tok.clone()).collect();
 
         // After splicing, we should have tokens from child, then Eof (include is replaced)
@@ -1052,7 +1145,7 @@ mod tests {
             },
         ];
 
-        let (tokens, sm) = lex_from_vcl_show(&chunks).expect("lex ok");
+        let (tokens, _comments, sm) = lex_from_vcl_show(&chunks).expect("lex ok");
         let toks: Vec<Tok> = tokens.iter().map(|t| t.tok.clone()).collect();
 
         // All chunks consumed in order: root -> a -> b, then c
@@ -1096,7 +1189,7 @@ mod tests {
             },
         ];
 
-        let (tokens, sm) = lex_from_vcl_show(&chunks).expect("lex ok");
+        let (tokens, _comments, sm) = lex_from_vcl_show(&chunks).expect("lex ok");
 
         // Should parse without error; Builtin chunk is never added to source map (not consumed)
         // Tokens only from root

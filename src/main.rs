@@ -68,6 +68,11 @@ enum Cmd {
         #[arg(long)]
         rename: bool,
 
+        /// Omit source comments from the output (by default, `print`
+        /// re-emits them next to the code they were attached to).
+        #[arg(long)]
+        no_comments: bool,
+
         file: PathBuf,
     },
     /// Compare two VCL files for functional equivalence.
@@ -268,9 +273,14 @@ fn main() -> ExitCode {
         Cmd::Print {
             common,
             rename,
+            no_comments,
             file,
         } => match build(&file, &common, rename) {
-            Ok((program, _sm, _names)) => {
+            Ok((mut program, _sm, _names)) => {
+                if no_comments {
+                    program.comments = ast::CommentMap::default();
+                    program.trailing_comments = Vec::new();
+                }
                 println!("{}", printer::print(&program));
                 ExitCode::SUCCESS
             }

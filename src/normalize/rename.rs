@@ -103,10 +103,11 @@ impl Ctx {
 fn merge_subs(p: &mut Program) {
     let mut first_idx: HashMap<String, usize> = HashMap::new();
     let mut merged: Vec<Decl> = Vec::new();
-    for decl in p.decls.drain(..) {
+    for decl in std::mem::take(&mut p.decls) {
         if let Decl::Sub { name, body, span } = decl {
             if ast::is_builtin_sub(&name) {
                 if let Some(&idx) = first_idx.get(&name) {
+                    reattach_fragment_comments(p, span, &body);
                     if let Decl::Sub { body: existing, .. } = &mut merged[idx] {
                         existing.extend(body);
                     }
@@ -122,6 +123,45 @@ fn merge_subs(p: &mut Program) {
         }
     }
     p.decls = merged;
+}
+
+/// A merged-away builtin-sub fragment's own (former Decl-level) leading and
+/// trailing comments have no home once the fragment disappears -- reattach
+/// them as a leading, unindented comment on the first statement it
+/// contributes (the position that used to be "the start of this fragment's
+/// block" now sits mid-body of the merged sub). If the fragment's body is
+/// empty, there's nothing to attach them to and they're dropped.
+///
+/// The fragment's own orphan `after` comments (right before its own closing
+/// `}`) need no action here: they're already attached to the last stmt of
+/// `body`, which is about to become a mid-body stmt of the merged sub --
+/// exactly where they belong positionally.
+fn reattach_fragment_comments(p: &mut Program, fragment_span: ast::Span, body: &[Stmt]) {
+    let Some(frag_comments) = p.comments.take(fragment_span) else {
+        return;
+    };
+    let mut reattached: Vec<ast::LeadingComment> = frag_comments
+        .leading
+        .into_iter()
+        .map(|mut c| {
+            c.unindented = true;
+            c
+        })
+        .collect();
+    if let Some(text) = frag_comments.trailing {
+        reattached.push(ast::LeadingComment {
+            text,
+            unindented: true,
+        });
+    }
+    if reattached.is_empty() {
+        return;
+    }
+    if let Some(first_stmt) = body.first() {
+        let entry = p.comments.entry(first_stmt.span());
+        reattached.extend(std::mem::take(&mut entry.leading));
+        entry.leading = reattached;
+    }
 }
 
 fn build_decl_kind(p: &Program) -> HashMap<String, Kind> {
